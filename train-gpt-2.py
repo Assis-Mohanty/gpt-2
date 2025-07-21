@@ -29,9 +29,11 @@ class CasualSelfAttention(nn.Module):
         k=k.view(B,T,self.n_head,C//self.n_head).transpose(1,2)
         q=q.view(B,T,self.n_head,C//self.n_head).transpose(1,2)
         v=v.view(B,T,self.n_head,C//self.n_head).transpose(1,2)
-        att=(q@k.transpose(-2,-1))*(1.0/math.sqrt(k.size-1))
-        att=F.softmax(att,dim=1)
-        y=att@v
+        # att=(q@k.transpose(-2,-1))*(1.0/math.sqrt(k.size(-1)))
+        # att=F.softmax(att,dim=1)
+        # y=att@v
+        y=F.scaled_dot_product_attention(q,k,v,is_causal=True)
+        
         y=y.transpose(1,2).contiguous().view(B,T,C)
         y=self.c_proj(y)
         return y
@@ -43,7 +45,9 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd,4*config.n_embd)
         self.gelu=nn.GELU(approximate='tanh')
         self.c_proj=nn.Linear(4*config.n_embd,config.n_embd)
-    
+        self.c_proj.NANOGPT_SCALE_INIT = 1
+
+
     def forward(self,x):
         x=self.c_fc(x)
         x=self.gelu(x)
@@ -68,8 +72,7 @@ class Block(nn.Module):
 class GPT(nn.Module):
     def __init__(self,config):
         super().__init__()
-        self.config = config
-           
+        self.config = config           
         self.transformer = nn.ModuleDict(dict(
                wte=nn.Embedding(config.vocab_size,config.n_embd),
                wpe=nn.Embedding(config.block_size,config.n_embd),
@@ -79,8 +82,37 @@ class GPT(nn.Module):
         self.lm_head=nn.Linear(config.n_embd,config.vocab_size,bias=False)
             
         self.transformer.wte.weight = self.lm_head.weight
-        self.apply(self._init_weights) 
+        # self.apply(self._init_weights) 
     
+    def _init_weights(self,module):
+        if isinstance(module,nn.Linear):
+            std=0.02
+            if hasattr(module,'NANOGPT_SCALE_INIT'):
+                std*= (2*self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight,mean=0.0,std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module,nn.Embedding):
+            torch.nn.init.normal_(module.weight,mean=0.0,std=std)
+
+
+    def forward(self,idx,targets=None):
+        B,T=idx.size()
+        assert T<=self.config.block_size,f"cannot forward sequence lenght"
+        pos=torch.arange(0,T,dtype=torch.long,device=idx.device)
+        pos_emb=self.transformer.wpe(pos)
+        tok_emb=self.transformer.wte(idx)
+        x=tok_emb+pos_emb
+        for block in self.transformer.h:
+            x=block(x)
+        x=self.transformer.ln_f(x)
+        logits=self.lm_head(x)
+        loss=None
+        if targets is not None:
+            loss=F.cross_entropy(logits.view(-1,logits.size(-1)),targets.view(-1))
+        return logits,loss
+        
+
     @classmethod
     def from_pretrained(cls, model_type):
         """Loads pretrained GPT-2 model weights from huggingface"""
@@ -129,6 +161,119 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
-    
-model=GPT.from_pretrained('gpt2')
-print("qqq")
+
+device="cpu"
+if torch.cuda.is_available():
+    device ="cuda"
+elif hasattr(torch.backends,"mps") and torch.backends.mps.is_available():
+    device="mps"
+print (f"using device ",device)
+device="cpu"
+
+import tiktoken
+# enc=tiktoken.get_encoding('gpt2')
+# with open('input.txt','r') as f:
+#     text =f.read()
+# text =text[:1000]
+# tokens=enc.encode(text)
+# B,T=4,32
+# buf=torch.tensor(tokens[:B*T+1])
+# buf=buf.to(device)
+# x=buf[:-1].view(B,T)
+# y=buf[1:].view(B,T)
+
+import tiktoken
+
+class DataLoaderLite:
+    def __init__(self,B,T):
+        self.B=B
+        self.T=T
+        
+        with open('input.txt','r') as f:
+            text =f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens= enc.encode(text)
+        self.tokens=torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens)//(B*T)} batches")
+
+
+        self.current_position=0
+
+    def next_batch(self):
+        B,T = self.B , self.T
+        buf=self.tokens[self.current_position:self.current_position+ B*T+1]
+        x=(buf[:-1]).view(B,T)
+        y=(buf[1:]).view(B,T)
+        self.current_position += B*T
+
+        if self.current_position + (B*T+1):
+            self.current_position =0 
+        return x,y
+
+
+import time
+
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps"
+print(f"using device: {device}")
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
+# train_loader = DataLoaderLite(B=16, T=1024)
+train_loader = DataLoaderLite(B=4,T=32)
+
+torch.set_float32_matmul_precision('high')
+
+model=GPT(GPTConfig(vocab_size=50304))
+model.to(device)
+model= torch.compile(model)
+
+optimizer = torch.optim.AdamW(model.parameters(),lr=3e-4,betas=(0.9,0.05),eps=1e-8)
+
+for i in range(50):
+    t0 = time.time()
+    x,y=train_loader.next_batch()
+    x,y=x.to(device),y.to(device)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    torch.cuda.synchronize() 
+    t1 = time.time()
+    dt = (t1 - t0)*1000 
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
+
+enc=tiktoken.get_encoding('gpt2')
+model.eval()
+num_return_sequences = 5
+max_length = 30
+tokens = enc.encode("Hello, I'm a language model,")
+tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
+x = tokens.to(device)
+
+
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+while x.size(1) < max_length:
+    with torch.no_grad():
+        outputs = model(x)
+        logits=outputs[0] 
+        logits = logits[:, -1, :] 
+        probs = F.softmax(logits, dim=-1)
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        ix = torch.multinomial(topk_probs, 1)
+        xcol = torch.gather(topk_indices, -1, ix) 
+        x = torch.cat((x, xcol), dim=1)
+        
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(">", decoded)

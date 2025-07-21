@@ -247,9 +247,18 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
+total_batch_size=524288
+B=4
+T=32
+assert total_batch_size & (B*T)==0,
+grad_accum_steps=total_batch_size //(B*T)
+print(f"total desired batch size:{total_batch_size}")
+print(f"=> calculated gradient accumulation steps:{grad_accum_steps}")
 
-# train_loader = DataLoaderLite(B=16, T=1024)
-train_loader = DataLoaderLite(B=4,T=32)
+
+# train_loader = DataLoaderLite(B=16, T=1024)   
+train_loader = DataLoaderLite(B=B,T=T)
+# why cant we use high batch size why does that cause problem to gpu
 
 torch.set_float32_matmul_precision('high')
 
@@ -273,24 +282,26 @@ def get_lr(it):
     return min_lr * coeff * (max_lr-min_lr)
 
 
-
 # optimizer = torch.optim.AdamW(model.parameters(),lr=3e-4,betas=(0.9,0.05),eps=1e-8)
 optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 
 
 for step in range(max_steps):
     t0 = time.time()
-    x,y=train_loader.next_batch()
-    x,y=x.to(device),y.to(device)
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-    loss.backward()
+    optimizer.zero_grad()
+    loss_accum=0.0
+    for micro_step in range(grad_accum_steps):
+        x,y=train_loader.next_batch()
+        x,y=x.to(device),y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        loss=loss / grad_accum_steps
+        loss+=loss.detach() 
+        loss.backward()
     norm=torch.nn.utils.clip_grad_norm_(model.paramerters(),1,0)
     lr=get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr']=lr
-    
-    
     optimizer.step()
     torch.cuda.synchronize() 
     t1 = time.time()

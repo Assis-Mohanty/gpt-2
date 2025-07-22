@@ -1,8 +1,14 @@
 from dataclasses import dataclass
 import torch
+import inspect
 import torch.nn as nn
 from torch.nn import functional as F
 import math
+import time 
+import os
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 @dataclass
 class GPTConfig:
     block_size: int =1024
@@ -29,9 +35,11 @@ class CasualSelfAttention(nn.Module):
         k=k.view(B,T,self.n_head,C//self.n_head).transpose(1,2)
         q=q.view(B,T,self.n_head,C//self.n_head).transpose(1,2)
         v=v.view(B,T,self.n_head,C//self.n_head).transpose(1,2)
-        att=(q@k.transpose(-2,-1))*(1.0/math.sqrt(k.size(-1)))
-        att=F.softmax(att,dim=1)
-        y=att@v
+        # att=(q@k.transpose(-2,-1))*(1.0/math.sqrt(k.size(-1)))
+        # att=F.softmax(att,dim=1)
+        # y=att@v
+        y=F.scaled_dot_product_attention(q,k,v,is_causal=True)
+        
         y=y.transpose(1,2).contiguous().view(B,T,C)
         y=self.c_proj(y)
         return y
@@ -159,6 +167,27 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
+    
+    
+    def configure_optimizers(self,weight_decay,learning_rate,device):
+        param_dict={pn: p for pn,p in self.named_parameters()}
+        param_dict={pn: p for pn,p in param_dict.items() if p.requires_grad}
+        
+        decay_params=[p for n, p in param_dict.items() if p.dim()>=2]
+        nodecay_params=[p for n, p in param_dict.items() if p.dim ()<2]
+        optim_groups=[
+            {'params':decay_params, 'weight_decay':weight_decay},
+            {'params':nodecay_params, 'weight_decay':0},
+        ]
+        num_decay_params=sum(p.numel() for p in decay_params)
+        num_nodecay_params=sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensor:{len(decay_params)},with {num_decay_params:} parameters")
+        print(f"num nodecayed parameter tensor:{len(nodecay_params)},with {num_nodecay_params:} parameters")
+        fused_available='fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused=fused_available and 'cuda' in device
+        print(f"using fused AdamW:{use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups,lr=learning_rate,betas=(0.9,0.95),eps=1e-8,fused=use_fused)
+        return optimizer
 
 device="cpu"
 if torch.cuda.is_available():
@@ -180,10 +209,10 @@ import tiktoken
 # x=buf[:-1].view(B,T)
 # y=buf[1:].view(B,T)
 
-
+import tiktoken
 
 class DataLoaderLite:
-    def __init__(self,B,T):
+    def __init__(self,B,T,process_rank,num_processes):
         self.B=B
         self.T=T
         
@@ -196,50 +225,152 @@ class DataLoaderLite:
         print(f"1 epoch = {len(self.tokens)//(B*T)} batches")
 
 
-        self.current_position=0
+        self.current_position=self.B *self.T * self.process_rank
 
     def next_batch(self):
         B,T = self.B , self.T
         buf=self.tokens[self.current_position:self.current_position+ B*T+1]
         x=(buf[:-1]).view(B,T)
         y=(buf[1:]).view(B,T)
-        self.current_position += B*T
+        self.current_position += B*T*self.num_processes
 
         if self.current_position + (B*T+1):
             self.current_position =0 
         return x,y
+from torch.distributed import init_process_group 
+
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    # use of DDP atm demands CUDA, we set the device appropriately according to rank
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+else:
+    # vanilla, non-DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # attempt to autodetect device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
 
 
-train_loader = DataLoaderLite(B=4,T=32)
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
 
-model=GPT(GPTConfig())
-model.to(device)
-model= torch.compile(model)
+total_batch_size=524288
+B=4
+T=32
+assert total_batch_size & (B*T* ddp_world_size)==0
+grad_accum_steps=total_batch_size //(B*T* ddp_world_size)
+if master_process:
+    print(f"total desired batch size:{total_batch_size}")
+    print(f"=> calculated gradient accumulation steps:{grad_accum_steps}")
 
-optimizer = torch.optim.AdamW(model.parameters(),lr=3e-4)
-
-for i in range(50):
-    x,y=train_loader.next_batch()
-    x,y=x.to(device),y.to(device)
-    optimizer.zero_grad()
-    logits,loss=model(x,y)
-    loss.backward()
-    optimizer.step()
-    print(f"step {i},loss:{loss.item()}")
-
-import tiktoken
+print("ddp rank :",ddp_rank)
 
 
-
-print(loss)
 import sys;sys.exit(0)
 
+# train_loader = DataLoaderLite(B=16, T=1024)   
+train_loader = DataLoaderLite(B=B,T=T,process_rank=ddp_rank,num_processes=ddp_world_size)
+# why cant we use high batch size why does that cause problem to gpu
+
+torch.set_float32_matmul_precision('high')
+
+model=GPT(GPTConfig(vocab_size=50304))
+model.to(device)
+model= torch.compile(model)
+from torch.nn.parallel import DistributedDataParallel as DDP
+if ddp:
+    model =DDP(model,device_ids=[ddp_local_rank])
+raw_model=model.module if ddp else model 
+max_lr=6e-4
+min_lr=max_lr*0.1
+warmup_steps=10
+max_steps=50
+
+def get_lr(it):
+    if it<warmup_steps:
+        return max_lr*(it+1)/warmup_steps
+    if it>max_steps:
+        return min_lr
+    decay_ratio=(it-warmup_steps)/(max_steps-warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff=0.5 * (1.0 * math.cos(math.pi * decay_ratio))
+    return min_lr * coeff * (max_lr-min_lr)
+
+
+# optimizer = torch.optim.AdamW(model.parameters(),lr=3e-4,betas=(0.9,0.05),eps=1e-8)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+
+import torch.distributed as dist
+for step in range(max_steps):
+    t0 = time.time()
+    optimizer.zero_grad()
+    loss_accum=0.0
+    for micro_step in range(grad_accum_steps):
+        x,y=train_loader.next_batch()
+        x,y=x.to(device),y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        loss=loss / grad_accum_steps
+        loss+=loss.detach()
+        if ddp:
+            model.require_backward_grad_sync=(micro_step==grad_accum_steps-1) 
+        loss.backward()
+if ddp:
+    dist.all_require(loss_accum,op=dist.ReduceOp.AVG)
+        
+    norm=torch.nn.utils.clip_grad_norm_(model.paramerters(),1,0)
+    lr=get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr']=lr
+    optimizer.step()
+    torch.cuda.synchronize() 
+    t1 = time.time()
+    dt = (t1 - t0)*1000 
+    tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps ) / (t1 - t0)
+    if master_process:
+        print(f"step {step}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
+
+if ddp:
+    destroy_process_group()
+enc=tiktoken.get_encoding('gpt2')
 model.eval()
+num_return_sequences = 5
+max_length = 30
+tokens = enc.encode("Hello, I'm a language model,")
+tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
+x = tokens.to(device)
 
 
-
-
-
-
-model=GPT.from_pretrained('gpt2')
-print("qqq")
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+while x.size(1) < max_length:
+    with torch.no_grad():
+        outputs = model(x)
+        logits=outputs[0] 
+        logits = logits[:, -1, :] 
+        probs = F.softmax(logits, dim=-1)
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        ix = torch.multinomial(topk_probs, 1)
+        xcol = torch.gather(topk_indices, -1, ix) 
+        x = torch.cat((x, xcol), dim=1)
+        
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(">", decoded)
